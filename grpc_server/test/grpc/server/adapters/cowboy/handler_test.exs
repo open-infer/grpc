@@ -126,27 +126,66 @@ defmodule GRPC.Server.Adapters.Cowboy.HandlerTest do
       end)
     end
 
-    test "rejects a request-streaming body that exceeds max_body_size with RESOURCE_EXHAUSTED (8)" do
+    test "rejects a streamed message that exceeds max_body_size with RESOURCE_EXHAUSTED (8)" do
       capture_log(fn ->
-        run_server_with_opts([RouteServer], [max_body_size: 512], fn port ->
-          # Each frame is small; the total across frames is what exceeds the cap.
-          frame = grpc_frame(Protobuf.encode(%Routeguide.Point{latitude: 1, longitude: 2}))
-          assert byte_size(frame) < 512, "each frame must individually fit under the cap"
+        run_server_with_opts([RouteServer], [max_body_size: 64], fn port ->
+          small = grpc_frame(Protobuf.encode(%Routeguide.Point{latitude: 1, longitude: 2}))
+          large = grpc_frame(:binary.copy(<<0>>, 65))
 
           conn = open_h2(port)
+          ref = :gun.post(conn, "/routeguide.RouteGuide/RecordRoute", grpc_request_headers())
 
-          ref =
-            :gun.post(conn, "/routeguide.RouteGuide/RecordRoute", grpc_request_headers())
-
-          # Stream enough frames to cross 512 bytes in aggregate.
-          chunks = div(512, byte_size(frame)) + 5
-          for _ <- 1..chunks, do: :gun.data(conn, ref, :nofin, frame)
+          :gun.data(conn, ref, :nofin, small)
+          :gun.data(conn, ref, :nofin, large)
           :gun.data(conn, ref, :fin, <<>>)
 
           assert collect_grpc_status(conn, ref) == "8"
 
           :gun.close(conn)
         end)
+      end)
+    end
+
+    test "rejects an oversized streamed message whose prefix is split across DATA frames" do
+      capture_log(fn ->
+        run_server_with_opts([RouteServer], [max_body_size: 64], fn port ->
+          <<head::binary-size(2), tail::binary>> = grpc_frame(:binary.copy(<<0>>, 65))
+
+          conn = open_h2(port)
+          ref = :gun.post(conn, "/routeguide.RouteGuide/RecordRoute", grpc_request_headers())
+
+          :gun.data(conn, ref, :nofin, head)
+          :gun.data(conn, ref, :nofin, tail)
+          :gun.data(conn, ref, :fin, <<>>)
+
+          assert collect_grpc_status(conn, ref) == "8"
+
+          :gun.close(conn)
+        end)
+      end)
+    end
+
+    test "allows a stream whose messages each fit max_body_size, however many there are" do
+      run_server_with_opts([RouteServer], [max_body_size: 512], fn port ->
+        frame = grpc_frame(Protobuf.encode(%Routeguide.Point{latitude: 1, longitude: 2}))
+        frames = div(512, byte_size(frame)) + 5
+
+        conn = open_h2(port)
+        ref = :gun.post(conn, "/routeguide.RouteGuide/RecordRoute", grpc_request_headers())
+
+        # Messages split across DATA frames at an offset that walks through each prefix.
+        body = :binary.copy(frame, frames)
+
+        for <<chunk::binary-size(3) <- body>>, do: :gun.data(conn, ref, :nofin, chunk)
+
+        rest =
+          binary_part(body, byte_size(body) - rem(byte_size(body), 3), rem(byte_size(body), 3))
+
+        :gun.data(conn, ref, :fin, rest)
+
+        assert collect_grpc_status(conn, ref) == "0"
+
+        :gun.close(conn)
       end)
     end
 

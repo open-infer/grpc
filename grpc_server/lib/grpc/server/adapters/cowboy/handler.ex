@@ -87,7 +87,8 @@ defmodule GRPC.Server.Adapters.Cowboy.Handler do
           codec: codec,
           exception_log_filter: exception_log_filter,
           max_body_size: max_body_size,
-          body_bytes_read: 0
+          message_head: <<>>,
+          message_left: 0
         }
       }
     else
@@ -603,21 +604,38 @@ defmodule GRPC.Server.Adapters.Cowboy.Handler do
     end
   end
 
-  # Streaming reads arrive in chunks, so the cap is applied to the running total
-  # rather than to any single chunk. read_full_body/4 does the same for unary calls.
-  defp track_body_bytes(state, body) do
-    total = Map.get(state, :body_bytes_read, 0) + byte_size(body)
+  # Streaming reads arrive in chunks that don't line up with messages, so each message's 5-byte
+  # prefix is followed across them and the cap applies to the length it declares, as gRPC-Go's
+  # max receive message size does. A stream carries any number of messages over its life, and
+  # what it has buffered is held to its HTTP/2 receive window, so the message the reader must
+  # hold whole is what needs the cap. An oversized message is refused at its prefix, before its
+  # payload arrives. read_full_body/4 caps a unary call's one message the same way.
+  defp track_body_bytes(%{message_left: left} = state, body) when left > 0 do
+    case body do
+      <<_::binary-size(^left), rest::binary>> ->
+        track_body_bytes(%{state | message_left: 0}, rest)
 
-    if total > state.max_body_size do
-      {:too_large, total}
-    else
-      {:ok, %{state | body_bytes_read: total}}
+      _ ->
+        {:ok, %{state | message_left: left - byte_size(body)}}
     end
   end
 
-  defp body_too_large(req, state, total) do
+  defp track_body_bytes(%{message_head: head, max_body_size: max} = state, body) do
+    case head <> body do
+      <<_flag, length::unsigned-integer-size(32), _rest::binary>> when length > max ->
+        {:too_large, length}
+
+      <<_flag, length::unsigned-integer-size(32), rest::binary>> ->
+        track_body_bytes(%{state | message_head: <<>>, message_left: length}, rest)
+
+      partial ->
+        {:ok, %{state | message_head: partial}}
+    end
+  end
+
+  defp body_too_large(req, state, length) do
     Logger.warning(
-      "Request body exceeded max_body_size (#{state.max_body_size} bytes, got #{total})"
+      "Request message exceeded max_body_size (#{state.max_body_size} bytes, declared #{length})"
     )
 
     error = RPCError.exception(status: :resource_exhausted, message: "Request body too large")

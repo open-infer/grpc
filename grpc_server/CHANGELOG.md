@@ -6,6 +6,7 @@
 
   * Request data that waits for its handler is credited to the client once, when the handler reads it. It was credited on arrival and again on read, so the receive window grew without bound and a client was never held back. A handler that stops reading now holds its client to the stream window (`initial_stream_window_size`).
   * Unless set, the Cowboy adapter's connection window is 16 stream windows (`initial_connection_window_size`, `connection_window_margin_size`), so streams whose handlers stop reading can't take the whole connection window from the other streams on it.
+  * `max_body_size` caps each streamed message at the length its prefix declares, not the running total of a stream's bytes, so a long-lived request or bidirectional stream isn't reset once it has carried 4 MB. An oversized message is refused at its prefix, before its payload arrives; what a stream buffers is held to its receive window.
 
 ## v1.0.6 (2026-11-06)
 
